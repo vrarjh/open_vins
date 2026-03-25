@@ -192,6 +192,12 @@ void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
       PRINT_INFO("subscribing to cam (mono): %s\n", cam_topic.c_str());
     }
   }
+
+  // GPS
+  std::string topic_gps;
+  _nh->param<std::string>("topic_gps", topic_gps, "/gnss/fix");
+  sub_gps = _nh->subscribe(topic_gps, 10, &ROS1Visualizer::callback_gps, this);
+  PRINT_INFO("subscribing to GPS: %s\n", topic_gps.c_str());
 }
 
 void ROS1Visualizer::visualize() {
@@ -447,6 +453,8 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   _app->feed_measurement_imu(message);
   visualize_odometry(message.timestamp);
 
+  double timestamp = 0.0;
+
   // If the processing queue is currently active / running just return so we can keep getting measurements
   // Otherwise create a second thread to do our update in an async manor
   // The visualization of the state, images, and features will be synchronous with the update!
@@ -482,9 +490,17 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
         double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
         PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total, 1.0 / time_total, update_dt);
       }
+      timestamp = timestamp_imu_inC;
     }
     thread_update_running = false;
   });
+
+  // GPS
+  while (!gps_queue.empty() && gps_queue.at(0)->header.stamp.toSec() < timestamp){
+    ROS_INFO("Track gps and update");
+    _app->feed_measurement_gps(gps_queue.at(0));
+    gps_queue.pop_front();
+  }
 
   // If we are single threaded, then run single threaded
   // Otherwise detach this thread so it runs in the background!
@@ -586,6 +602,12 @@ void ROS1Visualizer::callback_stereo(const sensor_msgs::ImageConstPtr &msg0, con
   std::lock_guard<std::mutex> lck(camera_queue_mtx);
   camera_queue.push_back(message);
   std::sort(camera_queue.begin(), camera_queue.end());
+}
+
+// GPS
+void ROS1Visualizer::callback_gps(const sensor_msgs::NavSatFix::ConstPtr &msg) {
+  gps_queue.push_back(msg);
+  std::sort(gps_queue.begin(), gps_queue.end());
 }
 
 void ROS1Visualizer::publish_state() {

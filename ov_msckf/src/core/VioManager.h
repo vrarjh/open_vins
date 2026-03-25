@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <sensor_msgs/NavSatFix.h>
 
 #include "VioManagerOptions.h"
 
@@ -79,6 +80,10 @@ public:
    * @param message Contains our timestamp, images, and camera ids
    */
   void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
+
+  void feed_measurement_gps(const sensor_msgs::NavSatFix::ConstPtr &msg) { track_gps_and_update(msg); }
+
+  Eigen::Vector3d convert_lla_to_ENU(const Eigen::Vector3d &point_lla);
 
   /**
    * @brief Feed function for a synchronized simulated cameras
@@ -146,6 +151,13 @@ protected:
    * @param message Contains our timestamp, images, and camera ids
    */
   void track_image_and_update(const ov_core::CameraData &message);
+
+  // GPS
+  void track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &msg);
+
+  Eigen::Vector3d lla2ecef(const Eigen::Vector3d &lla);
+
+  Eigen::Matrix3d ecef2enuRot(const Eigen::Vector3d &ref_lla);
 
   /**
    * @brief This will do the propagation and feature updates to the state

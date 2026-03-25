@@ -54,6 +54,7 @@
 namespace ov_core {
 class YamlParser;
 struct CameraData;
+struct GpsData;
 } // namespace ov_core
 
 namespace ov_msckf {
@@ -114,6 +115,9 @@ public:
   /// Callback for synchronized stereo camera information
   void callback_stereo(const sensor_msgs::ImageConstPtr &msg0, const sensor_msgs::ImageConstPtr &msg1, int cam_id0, int cam_id1);
 
+  /// GPS
+  void callback_gps(const sensor_msgs::NavSatFix::ConstPtr &msg);
+
 protected:
   /// Publish the current state
   void publish_state();
@@ -152,6 +156,7 @@ protected:
   typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, sensor_msgs::Image> sync_pol;
   std::vector<std::shared_ptr<message_filters::Synchronizer<sync_pol>>> sync_cam;
   std::vector<std::shared_ptr<message_filters::Subscriber<sensor_msgs::Image>>> sync_subs_cam;
+  ros::Subscriber sub_gps; // GPS
 
   // For path viz
   unsigned int poses_seq_imu = 0;
@@ -178,6 +183,9 @@ protected:
   /// a nice feature to have for general robustness to bad camera drivers.
   std::deque<ov_core::CameraData> camera_queue;
   std::mutex camera_queue_mtx;
+
+  // GPS
+  std::deque<sensor_msgs::NavSatFix::ConstPtr> gps_queue;
 
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;
