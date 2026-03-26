@@ -793,7 +793,7 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
     } else if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_FIX) {
         cov_enu *= 1.0;   // 일반 Fix
     } else {
-        cov_enu *= 10.0;  // Float/불확실 → 약하게 반영
+        cov_enu *= 100.0;  // Float/불확실 → 약하게 반영
     }
 
     // EKF 업데이트
