@@ -782,19 +782,9 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
         for (int j = 0; j < 3; j++)
             cov_lla(i,j) = msg->position_covariance[i*3 + j];
 
-    // 근사 변환 계수 (위도 1도 ≈ 111km, 경도는 cos(lat) 고려)
-    double lat_m = 111000.0;
-    double lon_m = 111000.0 * cos(lla[0]);
-    Eigen::Matrix3d S;
-    S << lon_m, 0,     0,
-         0,     lat_m, 0,
-         0,     0,     1;  // 고도 그대로(고도는 각도가 아닌 미터단위이기 때문)
-
-    Eigen::Matrix3d cov_m = S * cov_lla * S.transpose();
-
     // ECEF->ENU 회전 적용
     Eigen::Matrix3d R_enu2vio = gps_to_vio_r * R_ecef2enu;
-    Eigen::Matrix3d cov_enu = R_enu2vio * cov_m * R_enu2vio.transpose();
+    Eigen::Matrix3d cov_enu = R_enu2vio * cov_lla * R_enu2vio.transpose();
 
     // GPS 품질 기반 weighting
     // NavSatStatus 상태나 Septentrio SBF mode에 따라 가중치 조정 가능
