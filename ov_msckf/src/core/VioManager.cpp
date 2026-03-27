@@ -789,18 +789,17 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
     // GPS 품질 기반 weighting
     // NavSatStatus 상태나 Septentrio SBF mode에 따라 가중치 조정 가능
     if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_GBAS_FIX) {
-        cov_enu *= 0.01;  // RTK Fix → 강하게 신뢰
+        cov_enu(0,0) *= 0.01;
+        cov_enu(1,1) *= 0.01;
+        cov_enu(2,2) *= 0.04; // 고도는 약하게 신뢰
 
-        StateHelper::EKFUpdate(state, H_order, H_small, res, cov_enu);
     } else if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_FIX) {
         cov_enu(0,0) *= 10.0;
         cov_enu(1,1) *= 10.0;
         cov_enu(2,2) *= 100.0; // 고도는 약하게 신뢰
-
-        StateHelper::EKFUpdate(state, H_order, H_small, res, cov_enu);
-    } else {
-        // 이 데이터들은 EKF Update 안함(값을 사용하기에 신뢰할수없음)
     }
+
+    StateHelper::EKFUpdate(state, H_order, H_small, res, cov_enu);
 
     // EKF 업데이트 방식
     // 1. 잔차 계산
