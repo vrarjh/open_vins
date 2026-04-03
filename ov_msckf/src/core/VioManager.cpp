@@ -713,19 +713,15 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
 }
 
+// reference: https://arxiv.org/html/2309.12005v2
 void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &msg) {
-    // GPS fix 체크
-    if (msg->status.status < sensor_msgs::NavSatStatus::STATUS_FIX) {
-        //RCLCPP_WARN(this->get_logger(), "No GPS fix!");
+    // 1. GPS Fix 및 VIO 초기화 상태 체크
+    if (msg->status.status < sensor_msgs::NavSatStatus::STATUS_FIX || !is_initialized_vio) {
         return;
     }
 
-    // LLA -> Eigen Vector3d (rad)
-    Eigen::Vector3d lla(msg->latitude * M_PI / 180.0,
-                        msg->longitude * M_PI / 180.0,
-                        msg->altitude);
-
-    // 기준점 설정 (첫번째 valid GPS)
+    // 2. LLA -> ENU 변환 (기존 코드 유지)
+    Eigen::Vector3d lla(msg->latitude * M_PI / 180.0, msg->longitude * M_PI / 180.0, msg->altitude);
     static bool ref_set = false;
     static Eigen::Vector3d ref_lla;
     if (!ref_set) {
@@ -733,73 +729,156 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
         ref_set = true;
     }
 
-    // LLA -> ECEF
-    Eigen::Vector3d ecef, ecef_ref;
-    ecef = lla2ecef(lla);
-    ecef_ref = lla2ecef(ref_lla);
-
-    // ECEF -> ENU
+    Eigen::Vector3d ecef = lla2ecef(lla);
+    Eigen::Vector3d ecef_ref = lla2ecef(ref_lla);
     Eigen::Matrix3d R_ecef2enu = ecef2enuRot(ref_lla);
-    Eigen::Vector3d G_p_Gps = R_ecef2enu * (ecef - ecef_ref);
+    Eigen::Vector3d G_p_Gps = R_ecef2enu * (ecef - ecef_ref); // 측정값 (z)
 
-    // --- GPS(ENU) -> VIO(IMU) 좌표계 변환 (extrinsic) ---
-    // 회전: yaw +90도 (Z축)
-    double yaw_rad = 90.0 * M_PI / 180.0;
-    Eigen::Matrix3d gps_to_vio_r = Eigen::AngleAxisd(yaw_rad, Eigen::Vector3d::UnitZ()).toRotationMatrix();
 
-    // Translation: 카메라 기준 GPS 안테나 위치 (m)
-    Eigen::Vector3d gps_to_vio_t(0.01, 0.02, -0.04); // x:right, y:down, z:forward
+    // ==========================================
+    // 단계 2: 초기 정렬 로직 (Alignment Phase)
+    // ==========================================
+    static bool is_gps_aligned = false;
+    static bool first_gps_received = false;
+    static Eigen::Vector3d p_V_start, p_G_start;
 
-    // VIO 좌표계 ENU GPS 포지션 예측치 벡터3 = enu to vio 회전행렬(3,3) * Gps to ENU 포지션 벡터3 + rtk gnss apc to vio(imu)
-    Eigen::Vector3d exp_VIO_p_Gps = gps_to_vio_r * G_p_Gps + gps_to_vio_t;
+    if (!is_gps_aligned) {
+        if (!first_gps_received) {
+            // A. 첫 위치 저장
+            p_V_start = state->_imu->pos();
+            p_G_start = G_p_Gps;
+            first_gps_received = true;
+            PRINT_INFO(GREEN "[GPS-Align] First GPS received. Move the robot to align...\n" RESET);
+            return;
+        }
 
-    // VIO 좌표계 state-> imu의 로테이션, 포지션 현재 추정치 (IMU 상태에서 현재 위치)
-    Eigen::Matrix<double, 3, 3> R_Gtoi = state->_imu->Rot();
-    Eigen::Vector3d G_p_i = state->_imu->pos();
+        // B. 이동 거리 계산
+        double dist = (G_p_Gps - p_G_start).norm();
+        if (dist < 3.0) { // 최소 3미터 이동 필요 (Septentrio RTK 기준 2~3m면 충분)
+            return; 
+        }
 
-    // 잔차 residual = VIO좌표계 ENU 포지션 예측치 - VIO좌표계 IMU 포지션 벡터
-    Eigen::Vector3d res = exp_VIO_p_Gps - G_p_i;
+        // C. 방향(Yaw) 차이 계산
+        Eigen::Vector3d delta_V = state->_imu->pos() - p_V_start;
+        Eigen::Vector3d delta_G = G_p_Gps - p_G_start;
 
-    // 측정 행렬 H = 편미분 measurement / state
-    // GPS는 IMU 위치만 관측하므로, state의 포지션만 identity
-    // 그 외 bias, velocity, orientation에는 영향안줌.
-    // 즉, EKF 업데이트 시 포지션만 업데이트
-    // 잔차 = VIO좌표계 ENU 포지션 - VIO 좌표계 IMU 포지션(state 추정치)
-    // GPS 관측 모델에서 포지션만 사용하기 때문.
-    // block<3,3>(0,3) = 0,3부터 3x3 사이즈만큼 단위행렬로 채운다 -> state벡터의 포지션 부분
-    // 따라서, GPS 관측이 오직 state 벡터의 포지션 부분에만 영향을 준다.
-    // H_order 지정
+        double yaw_V = atan2(delta_V.y(), delta_V.x());
+        double yaw_G = atan2(delta_G.y(), delta_G.x());
+        double yaw_diff = yaw_G - yaw_V;
+
+        // D. 캘리브레이션 상태변수 초기화
+        // 회전 (Yaw축 기준 회전행렬 생성)
+        Eigen::Matrix3d R_VtoE_init = Eigen::AngleAxisd(yaw_diff, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        
+        // 평행이동 (p_EG = R_VE * p_VG + p_VE 공식을 거꾸로 계산)
+        // 안테나 오프셋(p_IG)은 일단 무시하거나 대략적으로 포함
+        Eigen::Vector3d p_V_G_curr = state->_imu->pos(); 
+        Eigen::Vector3d p_VE_init = G_p_Gps - R_VtoE_init * p_V_G_curr;
+
+        // EKF 상태에 반영
+        Eigen::VectorXd pose_val = Eigen::VectorXd::Zero(7);
+        Eigen::Quaterniond q_init(R_VtoE_init.transpose()); // OpenVINS PoseJPL은 GtoI(World to Body) 형태임에 유의
+        pose_val << q_init.x(), q_init.y(), q_init.z(), q_init.w(), p_VE_init.x(), p_VE_init.y(), p_VE_init.z();
+        
+        state->_calib_VIOtoENU->set_value(pose_val);
+        state->_calib_VIOtoENU->set_fej(pose_val);
+
+        is_gps_aligned = true;
+        PRINT_INFO(GREEN "[GPS-Align] Alignment Complete! Yaw Diff: %.2f deg\n" RESET, yaw_diff * 180.0 / M_PI);
+        return; // 정렬 직후에는 업데이트 건너뜀
+    }
+
+
+    // 3. 현재 필터 상태(State)에서 변수들 가져오기
+    // VIO의 IMU 상태
+    Eigen::Vector3d p_V_I = state->_imu->pos();
+    Eigen::Matrix3d R_I_V = state->_imu->Rot().transpose(); // Body to VIO World
+
+    // 우리가 추가한 VIO-to-ENU 캘리브레이션 상태
+    Eigen::Matrix3d R_V_E = state->_calib_VIOtoENU->Rot().transpose(); // VIO to ENU
+    Eigen::Vector3d p_V_E = state->_calib_VIOtoENU->pos();             // Translation in ENU
+
+    // IMU 기준 안테나 오프셋 (Lever-arm)
+    Eigen::Vector3d p_I_G(0.0, 0.09, -0.15); // 안테나가 리얼센스 뒤쪽(-0.15m)에 장착됨. T265 IMU 기준(오른손 좌표계) y up
+
+    // 4. 예측 모델 계산 (h(x))
+    // VIO 좌표계에서의 안테나 위치: p_VG = p_VI + R_IV * p_IG
+    Eigen::Vector3d p_V_G = p_V_I + R_I_V * p_I_G;
+    // ENU 좌표계에서의 예측된 안테나 위치: p_EG = R_VE * p_VG + p_VE
+    Eigen::Vector3d p_E_G_pred = R_V_E * p_V_G + p_V_E;
+
+    // 최종 잔차 (Residual): 실제 GPS 위치 - 예측된 위치
+    Eigen::Vector3d res = G_p_Gps - p_E_G_pred;
+
+    // 5. Jacobian (H) 행렬 구성 - 논문의 핵심 파트
     std::vector<std::shared_ptr<Type>> H_order;
-    H_order.push_back(state->_imu);
+    H_order.push_back(state->_imu);             // IMU 상태 (15-DOF)
+    H_order.push_back(state->_calib_VIOtoENU);  // 캘리브레이션 상태 (6-DOF)
 
-    // 작은 Jacobian 구성 (IMU 관련 15차원 상태만)
-    Eigen::Matrix<double, 3, 15> H_small = Eigen::Matrix<double, 3, 15>::Zero();
-    H_small.block<3,3>(0,3) = Eigen::Matrix3d::Identity();
+    // 전체 H 행렬 크기: 3 (GPS x,y,z) x 21 (15 + 6)
+    Eigen::MatrixXd H_small = Eigen::MatrixXd::Zero(3, 21);
 
-    // GPS covariance 변환 (NavSatFix -> ENU)
-    Eigen::Matrix3d cov_lla;
+    // (A) VIO Position에 대한 미분: R_VE
+    H_small.block<3,3>(0, 3) = R_V_E; 
+
+    // (B) VIO Orientation에 대한 미분 (Lever-arm 보정)
+    // 수식: -R_VE * R_IV * skew(p_IG)
+    H_small.block<3,3>(0, 0) = -R_V_E * R_I_V * ov_core::skew_x(p_I_G);
+
+    // (C) Calibration Rotation (R_VE)에 대한 미분 - 논문 2309.12005v2의 핵심
+    // 수식: -skew(R_VE * p_VG)
+    H_small.block<3,3>(0, 15) = -ov_core::skew_x(R_V_E * p_V_G);
+
+    // (D) Calibration Translation (p_VE)에 대한 미분: Identity
+    H_small.block<3,3>(0, 18) = Eigen::Matrix3d::Identity();
+
+    // 6-1. GPS 공분산 설정 (Septentrio RTK 특성 반영)
+    Eigen::Matrix3d cov_lla = Eigen::Matrix3d::Zero();
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
             cov_lla(i,j) = msg->position_covariance[i*3 + j];
 
-    // ECEF->ENU 회전 적용
-    Eigen::Matrix3d R_enu2vio = gps_to_vio_r * R_ecef2enu;
-    Eigen::Matrix3d cov_enu = R_enu2vio * cov_lla * R_enu2vio.transpose();
+    Eigen::Matrix3d R_noise = R_ecef2enu * cov_lla * R_ecef2enu.transpose();
 
-    // GPS 품질 기반 weighting
+    // 6-2. 임계값(Clamping) 처리
+    // RTK Fix라도 필터의 유연성을 위해 최소 2cm ~ 5cm 정도의 여유를 둡니다.
+    double min_std_dev_xy = 0.02; // 수평 최소 표준편차 (2cm)
+    double min_std_dev_z  = 0.05; // 수직 최소 표준편차 (5cm, GPS는 원래 고도에 약함)
+
+    double min_var_xy = std::pow(min_std_dev_xy, 2);
+    double min_var_z  = std::pow(min_std_dev_z, 2);
+
+    // 각 대각 성분(Variance)에 하한선 적용
+    R_noise(0,0) = std::max(R_noise(0,0), min_var_xy); // East
+    R_noise(1,1) = std::max(R_noise(1,1), min_var_xy); // North
+    R_noise(2,2) = std::max(R_noise(2,2), min_var_z);  // Up
+
+    // 6-3. GPS 품질 기반 weighting
     // NavSatStatus 상태나 Septentrio SBF mode에 따라 가중치 조정 가능
-    if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_GBAS_FIX) {
-        cov_enu(0,0) *= 0.01;
-        cov_enu(1,1) *= 0.01;
-        cov_enu(2,2) *= 0.04; // 고도는 약하게 신뢰
+    if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_GBAS_FIX) 
+    {
+        R_noise(0,0) *= 0.01;
+        R_noise(1,1) *= 0.01;
+        R_noise(2,2) *= 0.04; // 고도는 약하게 신뢰
 
-    } else if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_FIX) {
-        cov_enu(0,0) *= 10.0;
-        cov_enu(1,1) *= 10.0;
-        cov_enu(2,2) *= 100.0; // 고도는 약하게 신뢰
+    }
+    else if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_SBAS_FIX) 
+    {
+        R_noise(0,0) *= 0.01;
+        R_noise(1,1) *= 0.01;
+        R_noise(2,2) *= 0.1;
+    }
+    else if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_FIX) 
+    {
+        R_noise(0,0) *= 10.0;
+        R_noise(1,1) *= 10.0;
+        R_noise(2,2) *= 100.0; // 고도는 약하게 신뢰
     }
 
-    StateHelper::EKFUpdate(state, H_order, H_small, res, cov_enu);
+    // 7. EKF Update 실행
+    StateHelper::EKFUpdate(state, H_order, H_small, res, R_noise);
+
+    PRINT_INFO(GREEN "[GPS-Align] res norm: %.2f\n" RESET, res.norm()); // 정렬이 잘된경우에는 이 값이 수 cm 내외로 유지되어야함
 
     // EKF 업데이트 방식
     // 1. 잔차 계산

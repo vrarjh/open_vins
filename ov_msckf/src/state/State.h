@@ -179,6 +179,13 @@ public:
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame (rpng model)
   std::shared_ptr<ov_type::JPLQuat> _calib_imu_ACCtoIMU;
 
+  // VIO World 좌표계를 GPS ENU 좌표계로 변환하는 파라미터 (R_VtoE, p_VinE)
+  // PoseJPL은 내부적으로 3차원 회전(Quaternion)과 3차원 위치(Vector)를 모두 가집니다.
+  std::shared_ptr<ov_type::PoseJPL> _calib_VIOtoENU;
+
+  // [선택] GPS와 IMU 사이의 시간 차이 (Time Offset)
+  std::shared_ptr<ov_type::Vec> _calib_dt_GPStoIMU;
+
 private:
   // Define that the state helper is a friend class of this class
   // This will allow it to access the below functions which should normally not be called

@@ -130,6 +130,18 @@ State::State(StateOptions &options) {
     }
   }
 
+  // [추가] GPS-VIO Calibration 변수 할당 및 ID 설정
+  _calib_VIOtoENU = std::make_shared<PoseJPL>();
+  _calib_VIOtoENU->set_local_id(current_id); // 현재 필터 상태에서의 순번 부여
+  _variables.push_back(_calib_VIOtoENU);     // EKF가 추적할 변수 리스트에 추가
+  current_id += _calib_VIOtoENU->size();     // 다음 변수를 위해 ID 증가 (PoseJPL은 6-DOF)
+
+  // [선택] GPS 시간 오프셋 변수 할당
+  _calib_dt_GPStoIMU = std::make_shared<Vec>(1);
+  _calib_dt_GPStoIMU->set_local_id(current_id);
+  _variables.push_back(_calib_dt_GPStoIMU);
+  current_id += _calib_dt_GPStoIMU->size();
+
   // Finally initialize our covariance to small value
   _Cov = std::pow(1e-3, 2) * Eigen::MatrixXd::Identity(current_id, current_id);
 
@@ -163,4 +175,9 @@ State::State(StateOptions &options) {
           std::pow(0.005, 2) * Eigen::MatrixXd::Identity(4, 4);
     }
   }
+
+  // [추가] GPS Calibration 변수의 초기 불확실성 설정
+  // 처음에는 좌표계 사이의 관계를 전혀 모르므로, 값을 비교적 크게 잡습니다.
+  _Cov.block(_calib_VIOtoENU->id(), _calib_VIOtoENU->id(), 3, 3) = std::pow(M_PI, 2) * Eigen::Matrix3d::Identity(); // 회전 오차: 180도 (최대)
+  _Cov.block(_calib_VIOtoENU->id() + 3, _calib_VIOtoENU->id() + 3, 3, 3) = std::pow(100.0, 2) * Eigen::Matrix3d::Identity(); // 위치 오차: 100m
 }
