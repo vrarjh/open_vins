@@ -442,72 +442,65 @@ void ROS1Visualizer::visualize_final() {
 }
 
 void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
-
-  // convert into correct format
+  // 1. IMU 데이터 피드 (항상 최우선)
   ov_core::ImuData message;
   message.timestamp = msg->header.stamp.toSec();
   message.wm << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
   message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
-
-  // send it to our VIO system
   _app->feed_measurement_imu(message);
   visualize_odometry(message.timestamp);
 
-  double timestamp = 0.0;
+  // 2. 처리 스레드가 이미 돌고 있다면 리턴
+  if (thread_update_running) return;
 
-  // If the processing queue is currently active / running just return so we can keep getting measurements
-  // Otherwise create a second thread to do our update in an async manor
-  // The visualization of the state, images, and features will be synchronous with the update!
-  if (thread_update_running)
-    return;
   thread_update_running = true;
-  std::thread thread([&] {
-    // Lock on the queue (prevents new images from appending)
-    std::lock_guard<std::mutex> lck(camera_queue_mtx);
+  std::thread thread([&, message] { // 현재 IMU 메시지를 캡처
+      // 큐 접근을 위한 락
+      std::lock_guard<std::mutex> lck(camera_queue_mtx);
 
-    // Count how many unique image streams
-    std::map<int, bool> unique_cam_ids;
-    for (const auto &cam_msg : camera_queue) {
-      unique_cam_ids[cam_msg.sensor_ids.at(0)] = true;
-    }
+      // 카메라 개수 확인 로직 (기존 유지)
+      std::map<int, bool> unique_cam_ids;
+      for (const auto &cam_msg : camera_queue) unique_cam_ids[cam_msg.sensor_ids.at(0)] = true;
 
-    // If we do not have enough unique cameras then we need to wait
-    // We should wait till we have one of each camera to ensure we propagate in the correct order
-    auto params = _app->get_params();
-    size_t num_unique_cameras = (params.state_options.num_cameras == 2) ? 1 : params.state_options.num_cameras;
-    if (unique_cam_ids.size() == num_unique_cameras) {
+      auto params = _app->get_params();
+      size_t num_unique_cameras = (params.state_options.num_cameras == 2) ? 1 : params.state_options.num_cameras;
 
-      // Loop through our queue and see if we are able to process any of our camera measurements
-      // We are able to process if we have at least one IMU measurement greater than the camera time
-      double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
-      while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
-        auto rT0_1 = boost::posix_time::microsec_clock::local_time();
-        double update_dt = 100.0 * (timestamp_imu_inC - camera_queue.at(0).timestamp);
-        _app->feed_measurement_camera(camera_queue.at(0));
-        visualize();
-        camera_queue.pop_front();
-        auto rT0_2 = boost::posix_time::microsec_clock::local_time();
-        double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
-        PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total, 1.0 / time_total, update_dt);
+      if (unique_cam_ids.size() == num_unique_cameras) {
+          double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
+
+          // [핵심 수정] 카메라와 GPS를 시간 순서대로 인터리빙(Interleaving) 처리
+          while (true) {
+              bool processed = false;
+
+              // A. GPS 데이터 처리 (카메라보다 먼저 온 것이 있다면)
+              if (!gps_queue.empty() && gps_queue.at(0)->header.stamp.toSec() < timestamp_imu_inC) {
+                  // 단, 카메라 큐의 첫 데이터보다도 먼저 온 것만 처리하여 순서 보장
+                  if (camera_queue.empty() || gps_queue.at(0)->header.stamp.toSec() < camera_queue.at(0).timestamp) {
+                      _app->feed_measurement_gps(gps_queue.at(0));
+                      gps_queue.pop_front();
+                      processed = true;
+                  }
+              }
+
+              // B. 카메라 데이터 처리
+              if (!processed && !camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
+                  _app->feed_measurement_camera(camera_queue.at(0));
+                  visualize();
+                  camera_queue.pop_front();
+                  processed = true;
+              }
+
+              // 처리할 게 없으면 탈출
+              if (!processed) break;
+          }
       }
-      timestamp = timestamp_imu_inC;
-    }
-    thread_update_running = false;
+      thread_update_running = false;
   });
 
-  // GPS
-  while (!gps_queue.empty() && gps_queue.at(0)->header.stamp.toSec() < timestamp){
-    ROS_INFO("Track gps and update");
-    _app->feed_measurement_gps(gps_queue.at(0));
-    gps_queue.pop_front();
-  }
-
-  // If we are single threaded, then run single threaded
-  // Otherwise detach this thread so it runs in the background!
   if (!_app->get_params().use_multi_threading_subs) {
-    thread.join();
+      thread.join();
   } else {
-    thread.detach();
+      thread.detach();
   }
 }
 
