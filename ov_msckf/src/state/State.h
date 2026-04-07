@@ -192,6 +192,8 @@ private:
   // This prevents a developer from thinking that the "insert clone" will actually correctly add it to the covariance
   friend class StateHelper;
 
+  friend class VioManager;
+
   /// Covariance of all active variables
   Eigen::MatrixXd _Cov;
 

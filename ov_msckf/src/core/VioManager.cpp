@@ -734,6 +734,8 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
     Eigen::Matrix3d R_ecef2enu = ecef2enuRot(ref_lla);
     Eigen::Vector3d G_p_Gps = R_ecef2enu * (ecef - ecef_ref); // 측정값 (z)
 
+    // IMU 기준 안테나 오프셋 (Lever-arm)
+    Eigen::Vector3d p_I_G(0.0, 0.09, -0.15); // 안테나가 리얼센스 뒤쪽(-0.15m)에 장착됨. T265 IMU 기준(오른손 좌표계) y up
 
     // ==========================================
     // 단계 2: 초기 정렬 로직 (Alignment Phase)
@@ -771,8 +773,12 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
         Eigen::Matrix3d R_VtoE_init = Eigen::AngleAxisd(yaw_diff, Eigen::Vector3d::UnitZ()).toRotationMatrix();
         
         // 평행이동 (p_EG = R_VE * p_VG + p_VE 공식을 거꾸로 계산)
-        // 안테나 오프셋(p_IG)은 일단 무시하거나 대략적으로 포함
-        Eigen::Vector3d p_V_G_curr = state->_imu->pos(); 
+        // p_V_G_curr: 현재 VIO 월드 기준의 '안테나' 위치
+        Eigen::Vector3d p_V_I_curr = state->_imu->pos();
+        Eigen::Matrix3d R_I_V_curr = state->_imu->Rot().transpose();
+        Eigen::Vector3d p_V_G_curr = p_V_I_curr + R_I_V_curr * p_I_G;
+
+        // p_VE: ENU 원점과 VIO 원점의 차이
         Eigen::Vector3d p_VE_init = G_p_Gps - R_VtoE_init * p_V_G_curr;
 
         // EKF 상태에 반영
@@ -782,6 +788,14 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
         
         state->_calib_VIOtoENU->set_value(pose_val);
         state->_calib_VIOtoENU->set_fej(pose_val);
+
+        // [추가] 정렬 직후 공분산 리셋 (매우 중요!)
+        // 정렬이 되었더라도 초기값이니 불확실성을 다시 키워줍니다.
+        // 그래야 5m 같은 큰 잔차가 들어와도 필터가 터지지 않고 서서히 수렴합니다.
+        int id = state->_calib_VIOtoENU->id();
+        state->_Cov.block(id, id, 6, 6).setZero();
+        state->_Cov.block(id, id, 3, 3) = std::pow(0.5, 2) * Eigen::Matrix3d::Identity();   // 회전: 약 30도 오차 허용
+        state->_Cov.block(id + 3, id + 3, 3, 3) = std::pow(5.0, 2) * Eigen::Matrix3d::Identity(); // 위치: 5m 오차 허용
 
         is_gps_aligned = true;
         PRINT_INFO(GREEN "[GPS-Align] Alignment Complete! Yaw Diff: %.2f deg\n" RESET, yaw_diff * 180.0 / M_PI);
@@ -797,9 +811,6 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
     // 우리가 추가한 VIO-to-ENU 캘리브레이션 상태
     Eigen::Matrix3d R_V_E = state->_calib_VIOtoENU->Rot().transpose(); // VIO to ENU
     Eigen::Vector3d p_V_E = state->_calib_VIOtoENU->pos();             // Translation in ENU
-
-    // IMU 기준 안테나 오프셋 (Lever-arm)
-    Eigen::Vector3d p_I_G(0.0, 0.09, -0.15); // 안테나가 리얼센스 뒤쪽(-0.15m)에 장착됨. T265 IMU 기준(오른손 좌표계) y up
 
     // 4. 예측 모델 계산 (h(x))
     // VIO 좌표계에서의 안테나 위치: p_VG = p_VI + R_IV * p_IG
@@ -840,6 +851,8 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
 
     Eigen::Matrix3d R_noise = R_ecef2enu * cov_lla * R_ecef2enu.transpose();
 
+    static int update_count = 0;
+
     // 6-2. 임계값(Clamping) 처리
     // RTK Fix라도 필터의 유연성을 위해 최소 2cm ~ 5cm 정도의 여유를 둡니다.
     double min_std_dev_xy = 0.02; // 수평 최소 표준편차 (2cm)
@@ -873,6 +886,29 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
         R_noise(0,0) *= 10.0;
         R_noise(1,1) *= 10.0;
         R_noise(2,2) *= 100.0; // 고도는 약하게 신뢰
+    }
+
+    if (update_count < 20) {
+      R_noise *= 100.0; // 처음 20개 데이터는 아주 약하게 반영 (Soft-start)
+      update_count++;
+    }
+
+    // 7. EKF Update 전 안전성 검사 (Chi-squared test)
+    // S = H * P * H.transpose() + R
+
+    // [수정된 부분] state->가 아니라 StateHelper::를 사용하며, 첫 번째 인자로 state를 넘겨줍니다.
+    Eigen::MatrixXd P_small = StateHelper::get_marginal_covariance(state, H_order);
+    Eigen::Matrix3d S = H_small * P_small * H_small.transpose() + R_noise;
+
+    // 마할라노비스 거리 계산
+    // (S.inverse() 대신 성능과 수치적 안정성을 위해 .ldlt().solve()를 권장합니다)
+    double mahalanobis_dist = res.transpose() * S.ldlt().solve(res);
+
+    // 자유도 3(x,y,z)에 대한 임계값
+    // 95% 신뢰구간 기준: 7.81, 99.9% 기준: 16.27
+    if (mahalanobis_dist > 16.27 || res.norm() > 3.0) {
+        PRINT_WARNING(YELLOW "[GPS-Update] Outlier detected! Res norm: %.2f, Chi2: %.2f. Skipping...\n" RESET, res.norm(), mahalanobis_dist);
+        return; // 업데이트를 건너뛰어 필터 발산을 막습니다.
     }
 
     // 7. EKF Update 실행
