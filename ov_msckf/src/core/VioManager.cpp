@@ -870,22 +870,22 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
     // NavSatStatus 상태나 Septentrio SBF mode에 따라 가중치 조정 가능
     if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_GBAS_FIX) 
     {
-        R_noise(0,0) *= 0.01;
-        R_noise(1,1) *= 0.01;
-        R_noise(2,2) *= 0.04; // 고도는 약하게 신뢰
+        R_noise(0,0) *= 1;
+        R_noise(1,1) *= 1;
+        R_noise(2,2) *= 1.2; // 고도는 약하게 신뢰
 
     }
     else if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_SBAS_FIX) 
     {
-        R_noise(0,0) *= 0.01;
-        R_noise(1,1) *= 0.01;
-        R_noise(2,2) *= 0.1;
+        R_noise(0,0) *= 1;
+        R_noise(1,1) *= 1;
+        R_noise(2,2) *= 1.4;
     }
     else if (msg->status.status == sensor_msgs::NavSatStatus::STATUS_FIX) 
     {
         R_noise(0,0) *= 10.0;
         R_noise(1,1) *= 10.0;
-        R_noise(2,2) *= 100.0; // 고도는 약하게 신뢰
+        R_noise(2,2) *= 10000.0; // 고도는 아주 약하게 신뢰
     }
 
     if (update_count < 20) {
