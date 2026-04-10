@@ -183,6 +183,9 @@ public:
   // PoseJPL은 내부적으로 3차원 회전(Quaternion)과 3차원 위치(Vector)를 모두 가집니다.
   std::shared_ptr<ov_type::PoseJPL> _calib_VIOtoENU;
 
+  // IMU 기준 GPS 안테나 오프셋 (Lever-arm)
+  std::shared_ptr<ov_type::Vec> _calib_p_IG;
+
   // [선택] GPS와 IMU 사이의 시간 차이 (Time Offset)
   std::shared_ptr<ov_type::Vec> _calib_dt_GPStoIMU;
 

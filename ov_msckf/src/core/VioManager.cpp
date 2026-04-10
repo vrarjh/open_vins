@@ -825,9 +825,10 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
     std::vector<std::shared_ptr<Type>> H_order;
     H_order.push_back(state->_imu);             // IMU 상태 (15-DOF)
     H_order.push_back(state->_calib_VIOtoENU);  // 캘리브레이션 상태 (6-DOF)
+    H_order.push_back(state->_calib_p_IG); // 레버암 변수
 
-    // 전체 H 행렬 크기: 3 (GPS x,y,z) x 21 (15 + 6)
-    Eigen::MatrixXd H_small = Eigen::MatrixXd::Zero(3, 21);
+    // 전체 H 행렬 크기: 24 (15 + 6 + 3)
+    Eigen::MatrixXd H_small = Eigen::MatrixXd::Zero(3, 24);
 
     // (A) VIO Position에 대한 미분: R_VE
     H_small.block<3,3>(0, 3) = R_V_E; 
@@ -842,6 +843,9 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
 
     // (D) Calibration Translation (p_VE)에 대한 미분: Identity
     H_small.block<3,3>(0, 18) = Eigen::Matrix3d::Identity();
+
+    // (F) 레버암에 대한 자코비안 추가
+    H_small.block<3,3>(0, 21) = R_V_E * R_I_V;
 
     // 6-1. GPS 공분산 설정 (Septentrio RTK 특성 반영)
     Eigen::Matrix3d cov_lla = Eigen::Matrix3d::Zero();

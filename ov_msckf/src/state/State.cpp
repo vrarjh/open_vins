@@ -136,6 +136,16 @@ State::State(StateOptions &options) {
   _variables.push_back(_calib_VIOtoENU);     // EKF가 추적할 변수 리스트에 추가
   current_id += _calib_VIOtoENU->size();     // 다음 변수를 위해 ID 증가 (PoseJPL은 6-DOF)
 
+  _calib_p_IG = std::make_shared<Vec>(3);
+  _calib_p_IG->set_local_id(current_id);
+  _variables.push_back(_calib_p_IG);
+  current_id += _calib_p_IG->size();
+
+  // 초기값 설정 (사용자님이 측정하신 값)
+  Eigen::Vector3d p_IG_init(0.0, 0.09, -0.15);
+  _calib_p_IG->set_value(p_IG_init);
+  _calib_p_IG->set_fej(p_IG_init);
+
   // [선택] GPS 시간 오프셋 변수 할당
   _calib_dt_GPStoIMU = std::make_shared<Vec>(1);
   _calib_dt_GPStoIMU->set_local_id(current_id);
@@ -180,4 +190,6 @@ State::State(StateOptions &options) {
   // 처음에는 좌표계 사이의 관계를 전혀 모르므로, 값을 비교적 크게 잡습니다.
   _Cov.block(_calib_VIOtoENU->id(), _calib_VIOtoENU->id(), 3, 3) = std::pow(M_PI, 2) * Eigen::Matrix3d::Identity(); // 회전 오차: 180도 (최대)
   _Cov.block(_calib_VIOtoENU->id() + 3, _calib_VIOtoENU->id() + 3, 3, 3) = std::pow(100.0, 2) * Eigen::Matrix3d::Identity(); // 위치 오차: 100m
+  // imu gps 레버암 초기 공분산 설정 (측정 오차가 약 5cm~10cm 정도 있다고 가정)
+  _Cov.block(_calib_p_IG->id(), _calib_p_IG->id(), 3, 3) = std::pow(0.1, 2) * Eigen::Matrix3d::Identity();
 }
