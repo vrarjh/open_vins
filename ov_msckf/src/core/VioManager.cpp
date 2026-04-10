@@ -890,13 +890,13 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
         R_noise(2,2) *= 10000.0; // 고도는 아주 약하게 신뢰
     }
 
+    static int update_count = 0;
     if (is_gps_aligned)
     {
-      static int update_count = 0;
         if (update_count < 20) {
           R_noise *= 100.0; // 처음 20개 데이터는 아주 약하게 반영 (Soft-start)
-          update_count++;
       }
+      update_count++;
     }
 
     // 7. EKF Update 전 안전성 검사 (Chi-squared test)
