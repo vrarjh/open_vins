@@ -854,9 +854,7 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
             cov_lla(i,j) = msg->position_covariance[i*3 + j];
 
     Eigen::Matrix3d R_noise = R_ecef2enu * cov_lla * R_ecef2enu.transpose();
-
-    static int update_count = 0;
-
+    
     // 6-2. 임계값(Clamping) 처리
     // RTK Fix라도 필터의 유연성을 위해 최소 2cm ~ 5cm 정도의 여유를 둡니다.
     double min_std_dev_xy = 0.02; // 수평 최소 표준편차 (2cm)
@@ -892,9 +890,13 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
         R_noise(2,2) *= 10000.0; // 고도는 아주 약하게 신뢰
     }
 
-    if (update_count < 20) {
-      R_noise *= 100.0; // 처음 20개 데이터는 아주 약하게 반영 (Soft-start)
-      update_count++;
+    if (is_gps_aligned)
+    {
+      static int update_count = 0;
+        if (update_count < 20) {
+          R_noise *= 100.0; // 처음 20개 데이터는 아주 약하게 반영 (Soft-start)
+          update_count++;
+      }
     }
 
     // 7. EKF Update 전 안전성 검사 (Chi-squared test)
@@ -914,6 +916,10 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
         PRINT_WARNING(YELLOW "[GPS-Update] Outlier detected! Res norm: %.2f, Chi2: %.2f. Skipping...\n" RESET, res.norm(), mahalanobis_dist);
         return; // 업데이트를 건너뛰어 필터 발산을 막습니다.
     }
+
+    // 초기 안정성을 위한 댐핑
+    double damping = (update_count < 50) ? 0.1 : 0.5; // 처음 50번은 10%, 이후엔 50%만 반영
+    H_small *= damping;
 
     // 7. EKF Update 실행
     StateHelper::EKFUpdate(state, H_order, H_small, res, R_noise);
