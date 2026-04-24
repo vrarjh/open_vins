@@ -715,11 +715,33 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
 // reference: https://arxiv.org/html/2309.12005v2
 void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &msg) {
-    // 1. GPS Fix 및 VIO 초기화 상태 체크
-    // if (msg->status.status < sensor_msgs::NavSatStatus::STATUS_FIX || !is_initialized_vio) {
-    //     return;
-    // }
     if (msg->status.status < sensor_msgs::NavSatStatus::STATUS_SBAS_FIX || !is_initialized_vio) {
+        return;
+    }
+
+    // ==========================================
+    // 1. 타임스탬프 동기화 (가장 가까운 Clone 찾기)
+    // ==========================================
+    double t_gps = msg->header.stamp.toSec();
+    // State에 추가해둔 GPStoIMU 시간 오프셋 보정 반영
+    double t_gps_sync = t_gps + state->_calib_dt_GPStoIMU->value()(0); 
+
+    double min_dt = 1e9;
+    std::shared_ptr<ov_type::PoseJPL> closest_clone = nullptr;
+    double closest_time = -1;
+
+    for (const auto& clone : state->_clones_IMU) {
+        double dt = std::abs(clone.first - t_gps_sync);
+        if (dt < min_dt) {
+            min_dt = dt;
+            closest_clone = clone.second;
+            closest_time = clone.first;
+        }
+    }
+
+    // 유효한 클론을 찾지 못했거나, 시간 차이가 너무 크면(예: 100ms 이상) 업데이트 건너뜀
+    if (closest_clone == nullptr || min_dt > 0.1) {
+        PRINT_WARNING(YELLOW "[GPS] No valid clone found for sync. min_dt: %.3f sec\n" RESET, min_dt);
         return;
     }
 
@@ -737,21 +759,22 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
     Eigen::Matrix3d R_ecef2enu = ecef2enuRot(ref_lla);
     Eigen::Vector3d G_p_Gps = R_ecef2enu * (ecef - ecef_ref); // 측정값 (z)
 
-    // [확정] IMU 기준 안테나 오프셋 (OpenVINS x-front, y-left, z-up 기준)
-    // 안테나가 뒤쪽(-0.15m), 위쪽(+0.09m)
-    Eigen::Vector3d p_I_G(-0.15, 0.0, 0.09); 
+    // IMU 기준 안테나 오프셋 (OpenVINS x-front, y-left, z-up 기준)
+    Eigen::Vector3d p_I_G(-0.098, -0.021, 0.099); 
 
     // ==========================================
-    // 단계 2: 초기 정렬 로직 (Alignment Phase)
+    // 3. 초기 정렬 로직 (Alignment Phase)
     // ==========================================
     static bool is_gps_aligned = false;
     static bool first_gps_received = false;
     static Eigen::Vector3d p_V_start, p_G_start;
-    static int update_count = 0; // 업데이트 횟수 카운트
+    static int update_count = 0; 
+    static double yaw_diff_deg = 0;
 
     if (!is_gps_aligned) {
         if (!first_gps_received) {
-            p_V_start = state->_imu->pos();
+            // [수정] 최신 IMU 상태가 아닌 동기화된 클론의 위치 사용
+            p_V_start = closest_clone->pos(); 
             p_G_start = G_p_Gps;
             first_gps_received = true;
             PRINT_INFO(GREEN "[GPS-Align] First GPS received. Move the robot to align...\n" RESET);
@@ -759,146 +782,154 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
         }
 
         double dist = (G_p_Gps - p_G_start).norm();
-        if (dist < 2.0) return; // 최소 3미터 이동 필요
+        if (dist < 1.0) return; // 최소 이동 거리 확인
 
-        // C. 방향(Yaw) 차이 계산
-        Eigen::Vector3d delta_V = state->_imu->pos() - p_V_start;
+        // 방향(Yaw) 차이 계산
+        Eigen::Vector3d delta_V = closest_clone->pos() - p_V_start;
         Eigen::Vector3d delta_G = G_p_Gps - p_G_start;
 
-        // VIO(x,y)와 GPS(East, North) 간의 Yaw 계산
-        double yaw_V = atan2(delta_V.y(), delta_V.x());
-        double yaw_G = atan2(delta_G.x(), delta_G.y());
-        double yaw_diff = yaw_V - yaw_G;
+        double cross_product = delta_V.x() * delta_G.y() - delta_V.y() * delta_G.x();
+        double dot_product = delta_V.x() * delta_G.x() + delta_V.y() * delta_G.y();
+        double yaw_diff = std::atan2(cross_product, dot_product);
 
-        PRINT_INFO(YELLOW "[Check] VIO_Heading: %.2f, GPS_Heading: %.2f\n" RESET, 
-           yaw_V * 180/M_PI, yaw_G * 180/M_PI);
+        yaw_diff_deg = yaw_diff * 180.0 / M_PI;
+        PRINT_INFO(MAGENTA "[Result] Heading_Diff: %.2f deg\n" RESET, yaw_diff_deg);
 
-        // D. 캘리브레이션 상태변수 초기화
+        // 캘리브레이션 상태변수 초기화
         Eigen::Matrix3d R_VtoE_init = Eigen::AngleAxisd(yaw_diff, Eigen::Vector3d::UnitZ()).toRotationMatrix();
         
-        Eigen::Vector3d p_V_I_curr = state->_imu->pos();
-        Eigen::Matrix3d R_I_V_curr = state->_imu->Rot().transpose();
+        Eigen::Vector3d p_V_I_curr = closest_clone->pos();
+        Eigen::Matrix3d R_I_V_curr = closest_clone->Rot().transpose();
         Eigen::Vector3d p_V_G_curr = p_V_I_curr + R_I_V_curr * p_I_G;
         Eigen::Vector3d p_VE_init = G_p_Gps - R_VtoE_init * p_V_G_curr;
 
         Eigen::VectorXd pose_val = Eigen::VectorXd::Zero(7);
-        // OpenVINS PoseJPL은 World-to-Body(Global-to-Local)를 저장합니다.
-        // 따라서 ENU-to-VIO (R_EV)를 쿼터니언으로 넣어줘야 합니다.
         Eigen::Quaterniond q_EV(R_VtoE_init.transpose()); 
-        pose_val << q_EV.x(), q_EV.y(), q_EV.z(), q_EV.w(), p_VE_init.x(), p_VE_init.y(), p_VE_init.z();
+        // pose_val << q_EV.x(), q_EV.y(), q_EV.z(), q_EV.w(), p_VE_init.x(), p_VE_init.y(), p_VE_init.z();
+        // [중요 수정] Hamilton -> JPL 변환을 위해 x, y, z 부호를 반전 (-)
+        pose_val << -q_EV.x(), -q_EV.y(), -q_EV.z(), q_EV.w(), p_VE_init.x(), p_VE_init.y(), p_VE_init.z();
         
         state->_calib_VIOtoENU->set_value(pose_val);
         state->_calib_VIOtoENU->set_fej(pose_val);
 
-        // [중요] 초기 공분산 설정: 정렬 직후이므로 불확실성을 충분히 줍니다.
+        // [수정] 초기 정렬 직후, 이 캘리브레이션 값을 "Ground Truth"로 간주하여 필터가 건드리지 못하게 묶음
         int id = state->_calib_VIOtoENU->id();
-        state->_Cov.block(id, id, 3, 3) = std::pow(0.5, 2) * Eigen::Matrix3d::Identity();   // Yaw 약 30도 허용
-        state->_Cov.block(id + 3, id + 3, 3, 3) = std::pow(5.0, 2) * Eigen::Matrix3d::Identity(); // 위치 5m 허용
+        // Yaw 오차 허용치를 0.5rad에서 0.001rad(약 0.05도)로 극단적으로 낮춤
+        state->_Cov.block(id, id, 3, 3) = std::pow(0.001, 2) * Eigen::Matrix3d::Identity();   
+        // 위치 오차 허용치도 5m에서 1cm 수준으로 낮춤
+        state->_Cov.block(id + 3, id + 3, 3, 3) = std::pow(0.01, 2) * Eigen::Matrix3d::Identity();
 
         is_gps_aligned = true;
-        PRINT_INFO(GREEN "[GPS-Align] Alignment Complete! Yaw Diff: %.2f deg\n" RESET, yaw_diff * 180.0 / M_PI);
+        PRINT_INFO(GREEN "[GPS-Align] Alignment Complete! Yaw Diff: %.2f deg\n" RESET, yaw_diff_deg);
         return; 
     }
 
-    // 3. 현재 필터 상태 가져오기
-    Eigen::Vector3d p_V_I = state->_imu->pos();
-    Eigen::Matrix3d R_I_V = state->_imu->Rot().transpose(); 
+    // ==========================================
+    // 4. 동기화된 클론을 사용한 예측 모델 및 잔차 계산
+    // ==========================================
+    Eigen::Vector3d p_V_I = closest_clone->pos();
+    Eigen::Matrix3d R_I_V = closest_clone->Rot().transpose(); 
     Eigen::Matrix3d R_V_E = state->_calib_VIOtoENU->Rot().transpose(); 
     Eigen::Vector3d p_V_E = state->_calib_VIOtoENU->pos();
 
-    // 4. 예측 모델 및 잔차 계산
     Eigen::Vector3d p_V_G = p_V_I + R_I_V * p_I_G;
     Eigen::Vector3d p_E_G_pred = R_V_E * p_V_G + p_V_E;
     Eigen::Vector3d res = G_p_Gps - p_E_G_pred;
 
-    // 5. Jacobian (H) 구성
+    // ==========================================
+    // 5. Jacobian (H) 구성 - 크기 및 논리 수정
+    // ==========================================
     std::vector<std::shared_ptr<Type>> H_order;
-    H_order.push_back(state->_imu);
-    H_order.push_back(state->_calib_VIOtoENU);
+    H_order.push_back(closest_clone);          // 상태 벡터 크기 6 (Ori: 3, Pos: 3)
+    H_order.push_back(state->_calib_VIOtoENU); // 상태 벡터 크기 6 (Ori: 3, Pos: 3)
 
-    Eigen::MatrixXd H_small = Eigen::MatrixXd::Zero(3, 21);
-    H_small.block<3,3>(0, 3) = R_V_E; // VIO Pos
-    H_small.block<3,3>(0, 0) = -R_V_E * R_I_V * ov_core::skew_x(p_I_G); // VIO Ori
+    // Clone(6) + Calib(6) = 전체 12개의 열을 갖는 자코비안 생성
+    Eigen::MatrixXd H_small = Eigen::MatrixXd::Zero(3, 12);
     
-    // [확인 필요] Calib Rotation Jacobian: 궤적이 계속 휘면 이 부분 부호를 +로 반전해볼 것
-    H_small.block<3,3>(0, 15) = -ov_core::skew_x(R_V_E * p_V_G); 
-    H_small.block<3,3>(0, 18) = Eigen::Matrix3d::Identity(); // Calib Trans
+    // Closest Clone 자코비안 (0~5 열)
+    H_small.block<3,3>(0, 0) = -R_V_E * R_I_V * ov_core::skew_x(p_I_G); // VIO Ori
+    H_small.block<3,3>(0, 3) = R_V_E;                                   // VIO Pos
+    
+    // Calib 자코비안 (6~11 열) [수정됨: -R_V_E * skew(p_V_G)]
+    H_small.block<3,3>(0, 6) = -R_V_E * ov_core::skew_x(p_V_G);         // Calib Ori
+    H_small.block<3,3>(0, 9) = Eigen::Matrix3d::Identity();             // Calib Trans
 
-    // 6. GPS 공분산 설정 및 Soft-start 가중치
-    Eigen::Matrix3d cov_lla = Eigen::Matrix3d::Zero();
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++)
-            cov_lla(i,j) = msg->position_covariance[i*3 + j];
-
-    Eigen::Matrix3d R_noise = R_ecef2enu * cov_lla * R_ecef2enu.transpose();
-
-    // [중요] 초기 200 프레임 동안 GPS 신뢰도를 낮추어 부드럽게 수렴하게 함 (Bowing 방지)
-    // double multiplier = (update_count < 1000) ? 100.0 : 10.0;
-    // R_noise *= multiplier;
-    // R_noise(2,2) *= 1.4;
-
-    // if (update_count < 1000)
-    // {
-    //   R_noise *= 100.0;
-    //   R_noise(2,2) *= 1.4;
-    // }
-    // else if (update_count < 1500)
-    // {
-    //   R_noise *= 10.0;
-    //   R_noise(2,2) *= 14;
-    // }
-    // else
-    // {
-    //   R_noise *= 5.0;
-    //   R_noise(2,2) *= 14;
-    // }
-
-    if (update_count < 500)
-    {
-      R_noise *= 100.0;
-      R_noise(2,2) *= 1.4;
-    }
-    else if (update_count < 1000)
-    {
-      R_noise *= 10.0;
-      R_noise(2,2) *= 14;
-    }
-    else
-    {
-      R_noise *= 5.0;
-      R_noise(2,2) *= 14;
+    // ==========================================
+    // 6. GPS 공분산 설정 및 Soft-start
+    // ==========================================
+    Eigen::Matrix3d R_noise = Eigen::Matrix3d::Zero();
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            // position_covariance는 이미 ENU 기준이므로 회전 변환 불필요 (cov가 이미 ENU 기준으로 작성된 경우에만)
+            R_noise(i,j) = msg->position_covariance[i*3 + j];
+        }
     }
 
-    // 최소 표준편차 적용 (RTK 과신 방지)
-    // double min_var = std::pow(0.05, 2); 
-    // for(int i=0; i<3; ++i) R_noise(i,i) = std::max(R_noise(i,i), min_var);
+    R_noise(0,0) = std::max(R_noise(0,0), std::pow(0.02, 2)); // XY 최소 2cm 노이즈
+    R_noise(1,1) = std::max(R_noise(1,1), std::pow(0.02, 2));
+    R_noise(2,2) = std::max(R_noise(2,2), std::pow(0.04, 2));  // Z 최소 4cm 노이즈
 
-    // EKFUpdate를 주석 처리하고 아래만 실행
-    Eigen::Vector3d raw_error = G_p_Gps - p_E_G_pred;
+    // ==========================================
+    // 7. 동적 인덱스 기반 P 행렬 추출 및 마할라노비스 거리 계산
+    // ==========================================
+    Eigen::MatrixXd P = Eigen::MatrixXd::Zero(12, 12);
+    int id_clone = closest_clone->id(); 
+    int id_calib = state->_calib_VIOtoENU->id();
 
-    PRINT_INFO("GPS_RAW_ERROR: %.3f, %.3f, %.3f\n", 
-              raw_error.x(), raw_error.y(), raw_error.z());
+    // 동적으로 Covariance Matrix 조합
+    P.block<6,6>(0,0) = state->_Cov.block(id_clone, id_clone, 6, 6);
+    P.block<6,6>(6,6) = state->_Cov.block(id_calib, id_calib, 6, 6);
+    P.block<6,6>(0,6) = state->_Cov.block(id_clone, id_calib, 6, 6);
+    P.block<6,6>(6,0) = state->_Cov.block(id_calib, id_clone, 6, 6);
 
-    //7. 마할라노비스 거리 기반 Outlier 검사
-    Eigen::MatrixXd P = state->_Cov.block(0, 0, 21, 21); // 연관된 상태의 공분산만 추출
     Eigen::Matrix3d S = H_small * P * H_small.transpose() + R_noise;
     double mahalanobis_dist_sq = res.transpose() * S.inverse() * res;
 
-    // [중요] 초기에는 마할라노비스 게이트를 매우 넓게 설정 (2500 이상의 거리 수용)
-    double chi_threshold = (update_count < 1000) ? 5000.0 : 320.0; 
-    //double chi_threshold = 16.27;
+    double chi_threshold = (update_count < 1000) ? 10000.0 : 1320.0; 
 
     if (mahalanobis_dist_sq > chi_threshold) {
         PRINT_INFO(RED "[GPS] Count: %d, Rejected! distance: %.2f, res norm: %.2f\n" RESET, update_count, mahalanobis_dist_sq, res.norm());
         return;
     }
 
+    // ==========================================
     // 8. EKF Update 실행
+    // ==========================================
     StateHelper::EKFUpdate(state, H_order, H_small, res, R_noise);
     update_count++;
 
-    PRINT_INFO(GREEN "[GPS-Update] Count: %d, Mahalanobis: %.2f, Res Norm: %.2f\n" RESET, 
-                update_count, mahalanobis_dist_sq, res.norm());
+    PRINT_INFO(GREEN "[GPS-Update] Count: %d, dt: %.3f, Mahalanobis: %.2f, Res Norm: %.2f\n" RESET, 
+                update_count, min_dt, mahalanobis_dist_sq, res.norm());
+}
+
+
+// WGS84 constants
+const double a = 6378137.0;          // semi-major axis
+const double f = 1.0 / 298.257223563;// flattening
+const double e2 = f * (2 - f);       // eccentricity^2
+
+
+Eigen::Vector3d VioManager::lla2ecef(const Eigen::Vector3d &lla) {
+    double lat = lla[0];
+    double lon = lla[1];
+    double alt = lla[2];
+
+    double N = a / sqrt(1.0 - e2 * sin(lat) * sin(lat));
+    double x = (N + alt) * cos(lat) * cos(lon);
+    double y = (N + alt) * cos(lat) * sin(lon);
+    double z = (N * (1 - e2) + alt) * sin(lat);
+    return Eigen::Vector3d(x, y, z);
+}
+
+Eigen::Matrix3d VioManager::ecef2enuRot(const Eigen::Vector3d &ref_lla) {
+    double lat = ref_lla[0];
+    double lon = ref_lla[1];
+
+    Eigen::Matrix3d R;
+    R << -sin(lon),              cos(lon),             0,
+          -sin(lat)*cos(lon), -sin(lat)*sin(lon), cos(lat),
+          cos(lat)*cos(lon),  cos(lat)*sin(lon), sin(lat);
+    return R;
 }
 
     // EKF 업데이트 방식
@@ -932,33 +963,3 @@ void VioManager::track_gps_and_update(const sensor_msgs::NavSatFix::ConstPtr &ms
 
     // 공분산은 EKF 업데이트에서 칼만 이득을 조절하는 핵심 요소
     // 내부 상태 예측을 얼마나 믿을지, 외부 GPS 측정을 얼마나 믿을지를 정함.
-
-
-// WGS84 constants
-const double a = 6378137.0;          // semi-major axis
-const double f = 1.0 / 298.257223563;// flattening
-const double e2 = f * (2 - f);       // eccentricity^2
-
-
-Eigen::Vector3d VioManager::lla2ecef(const Eigen::Vector3d &lla) {
-    double lat = lla[0];
-    double lon = lla[1];
-    double alt = lla[2];
-
-    double N = a / sqrt(1.0 - e2 * sin(lat) * sin(lat));
-    double x = (N + alt) * cos(lat) * cos(lon);
-    double y = (N + alt) * cos(lat) * sin(lon);
-    double z = (N * (1 - e2) + alt) * sin(lat);
-    return Eigen::Vector3d(x, y, z);
-}
-
-Eigen::Matrix3d VioManager::ecef2enuRot(const Eigen::Vector3d &ref_lla) {
-    double lat = ref_lla[0];
-    double lon = ref_lla[1];
-
-    Eigen::Matrix3d R;
-    R << -sin(lon),              cos(lon),             0,
-          -sin(lat)*cos(lon), -sin(lat)*sin(lon), cos(lat),
-          cos(lat)*cos(lon),  cos(lat)*sin(lon), sin(lat);
-    return R;
-}

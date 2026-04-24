@@ -613,20 +613,68 @@ void ROS1Visualizer::publish_state() {
   double t_ItoC = state->_calib_dt_CAMtoIMU->value()(0);
   double timestamp_inI = state->_timestamp + t_ItoC;
 
+  // =========================================================
+  // [추가] Fused Pose 연산 (로컬 VIO 궤적에 캘리브레이션 변환 적용)
+  // =========================================================
+  // Eigen::Matrix3d R_V_E = state->_calib_VIOtoENU->Rot().transpose(); 
+  // Eigen::Vector3d p_V_E = state->_calib_VIOtoENU->pos();
+
+  // // 1. 글로벌 위치 융합
+  // Eigen::Vector3d p_fused = R_V_E * state->_imu->pos() + p_V_E;
+
+  // // 2. 글로벌 회전 융합
+  // Eigen::Quaterniond q_VIO(state->_imu->Rot().transpose());
+  // Eigen::Quaterniond q_V_E(R_V_E);
+  // Eigen::Quaterniond q_fused = q_V_E * q_VIO;
+  // q_fused.normalize(); // 정규화
+
+  // // =========================================================
+  
+  // // Create pose of IMU (note we use the bag time)
+  // geometry_msgs::PoseWithCovarianceStamped poseIinM;
+  // poseIinM.header.stamp = ros::Time(timestamp_inI);
+  // poseIinM.header.seq = poses_seq_imu;
+  
+  // // [수정] 프레임 ID를 global_enu (또는 원하는 글로벌 프레임 이름)로 변경
+  // poseIinM.header.frame_id = "global"; 
+
+  // // [수정] 기존 로컬 state 값 대신 Fused 값 적용
+  // poseIinM.pose.pose.orientation.x = q_fused.x();
+  // poseIinM.pose.pose.orientation.y = q_fused.y();
+  // poseIinM.pose.pose.orientation.z = q_fused.z();
+  // poseIinM.pose.pose.orientation.w = q_fused.w();
+  // poseIinM.pose.pose.position.x = p_fused.x();
+  // poseIinM.pose.pose.position.y = p_fused.y();
+  // poseIinM.pose.pose.position.z = p_fused.z();
+
+  // =========================================================
+  // [수정] VIO 좌표계(Local) 기준의 VIO+GPS Fused 결과 추출
+  // =========================================================
+  Eigen::Vector3d p_local_fused = state->_imu->pos();
+  Eigen::Quaterniond q_local_fused(state->_imu->Rot().transpose());
+  // =========================================================
+  
   // Create pose of IMU (note we use the bag time)
   geometry_msgs::PoseWithCovarianceStamped poseIinM;
   poseIinM.header.stamp = ros::Time(timestamp_inI);
   poseIinM.header.seq = poses_seq_imu;
-  poseIinM.header.frame_id = "global";
-  poseIinM.pose.pose.orientation.x = state->_imu->quat()(0);
-  poseIinM.pose.pose.orientation.y = state->_imu->quat()(1);
-  poseIinM.pose.pose.orientation.z = state->_imu->quat()(2);
-  poseIinM.pose.pose.orientation.w = state->_imu->quat()(3);
-  poseIinM.pose.pose.position.x = state->_imu->pos()(0);
-  poseIinM.pose.pose.position.y = state->_imu->pos()(1);
-  poseIinM.pose.pose.position.z = state->_imu->pos()(2);
+  
+  // [수정] 프레임 ID를 VIO 로컬 좌표계 이름으로 변경 (예: vio_local 또는 odom)
+  poseIinM.header.frame_id = "global"; 
 
-  // Finally set the covariance in the message (in the order position then orientation as per ros convention)
+  // [수정] 로컬 좌표계 기준 융합 값 적용
+  poseIinM.pose.pose.orientation.x = q_local_fused.x();
+  poseIinM.pose.pose.orientation.y = q_local_fused.y();
+  poseIinM.pose.pose.orientation.z = q_local_fused.z();
+  poseIinM.pose.pose.orientation.w = q_local_fused.w();
+  
+  poseIinM.pose.pose.position.x = p_local_fused.x();
+  poseIinM.pose.pose.position.y = p_local_fused.y();
+  poseIinM.pose.pose.position.z = p_local_fused.z();
+
+  // Finally set the covariance in the message
+  // [참고] 엄밀하게는 공분산도 R_V_E를 통해 회전시켜야 하지만, 
+  // Rviz 시각화 목적이 강하다면 기존 VIO 로컬 공분산을 그대로 넣어도 무방합니다.
   std::vector<std::shared_ptr<Type>> statevars;
   statevars.push_back(state->_imu->pose()->p());
   statevars.push_back(state->_imu->pose()->q());
@@ -648,12 +696,13 @@ void ROS1Visualizer::publish_state() {
   poses_imu.push_back(posetemp);
 
   // Create our path (imu)
-  // NOTE: We downsample the number of poses as needed to prevent rviz crashes
-  // NOTE: https://github.com/ros-visualization/rviz/issues/1107
   nav_msgs::Path arrIMU;
   arrIMU.header.stamp = ros::Time::now();
   arrIMU.header.seq = poses_seq_imu;
-  arrIMU.header.frame_id = "global";
+  
+  // [수정] Path의 프레임 ID도 동일하게 맞춰줍니다.
+  arrIMU.header.frame_id = "global"; 
+  
   for (size_t i = 0; i < poses_imu.size(); i += std::floor((double)poses_imu.size() / 16384.0) + 1) {
     arrIMU.poses.push_back(poses_imu.at(i));
   }
